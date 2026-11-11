@@ -23,11 +23,12 @@
 #include "duckdb/parallel/task_executor.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/common/vector/vector_iterator.hpp"
+#include "duckdb/common/vector/vector_writer.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/csv_scanner/csv_reader_options.hpp"
 #include "duckdb/logging/logger.hpp"
 #include "duckdb/function/function_binder.hpp"
-#include "duckdb/planner/expression/bound_case_expression.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -46,7 +47,6 @@
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/extension_helper.hpp"
-#include "duckdb/parser/expression/case_expression.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/comparison_expression.hpp"
@@ -65,6 +65,7 @@
 #include "duckdb/planner/sql_export_helpers.hpp"
 #include "catalog/glue_table.hpp"
 #include "core/glue_types.hpp"
+#include "core/readers/opencsv_line.hpp"
 #include "functions/hive_reader_call.hpp"
 
 namespace duckdb {
@@ -1109,9 +1110,17 @@ TableFunction BindHiveScan(ClientContext &context, shared_ptr<HiveScanInfo> scan
 		param_map["auto_detect"] = Value::BOOLEAN(false);
 		param_map["header"] = Value::BOOLEAN(false);
 		param_map["skip"] = Value::BIGINT(NumericCast<int64_t>(scan_info->csv_options.skip_lines));
-		param_map["delim"] = Value(scan_info->csv_options.delimiter);
-		param_map["quote"] = Value(scan_info->csv_options.quote);
-		param_map["escape"] = Value(scan_info->csv_options.escape);
+		if (scan_info->csv_options.line_fields) {
+			// each line split only at its NUL bytes (an empty delimiter is NUL), joined and split again by
+			// FinalizeChunk
+			param_map["delim"] = Value("");
+			param_map["quote"] = Value("");
+			param_map["escape"] = Value("");
+		} else {
+			param_map["delim"] = Value(scan_info->csv_options.delimiter);
+			param_map["quote"] = Value(scan_info->csv_options.quote);
+			param_map["escape"] = Value(scan_info->csv_options.escape);
+		}
 		param_map["nullstr"] = Value(scan_info->csv_options.null_string);
 		// a quoted empty field is an empty string, not NULL (Hive reads it that way, and DuckDB writes it for one)
 		param_map["allow_quoted_nulls"] = Value::BOOLEAN(false);
@@ -1133,7 +1142,7 @@ TableFunction BindHiveScan(ClientContext &context, shared_ptr<HiveScanInfo> scan
 			// as the SerDes do: missing trailing fields are NULL and the fields beyond the last column are ignored
 			param_map["null_padding"] = Value::BOOLEAN(true);
 			param_map["strict_mode"] = Value::BOOLEAN(false);
-			if (!scan_info->csv_options.quote.empty()) {
+			if (!scan_info->csv_options.quote.empty() && !scan_info->csv_options.line_fields) {
 				// the parallel scanner refuses null_padding together with a quoted line break (hive_csv_parallel)
 				Value parallel;
 				if (context.TryGetCurrentSetting("hive_csv_parallel", parallel) && !parallel.IsNull() &&
@@ -1722,29 +1731,16 @@ static void MakeEpoch(ClientContext &context, unique_ptr<Expression> &expr, bool
 	expr = std::move(value);
 }
 
-//! Drop the escape character read_csv does not apply from a field's text, before the text is converted; only a field
-//! that holds it goes through regexp_replace
-static void UnescapeField(ClientContext &context, unique_ptr<Expression> &expr, const HiveCSVOptions &options) {
-	auto &text = BoundCastExpression::IsCast(*expr)
-	                 ? BoundCastExpression::ChildMutable(expr->Cast<BoundFunctionExpression>())
-	                 : expr;
-	if (text->GetReturnType() != LogicalType::VARCHAR || text->IsFoldable()) {
-		return;
+void HiveMultiFileReader::FinalizeChunk(ClientContext &context, const MultiFileBindData &bind_data,
+                                        BaseFileReader &reader, const MultiFileReaderData &reader_data,
+                                        DataChunk &input_chunk, DataChunk &output_chunk, ExpressionExecutor &executor,
+                                        optional_ptr<MultiFileReaderGlobalState> global_state) {
+	auto &options = ScanInfo().csv_options;
+	if (options.serde_fields && options.line_fields) {
+		SplitOpenCSVLines(reader, reader_data, input_chunk, options);
 	}
-	vector<unique_ptr<Expression>> contains;
-	contains.push_back(text->Copy());
-	contains.push_back(make_uniq<BoundConstantExpression>(Value(options.field_escape)));
-	vector<unique_ptr<Expression>> replace;
-	replace.push_back(text->Copy());
-	replace.push_back(make_uniq<BoundConstantExpression>(Value(options.FieldEscapePattern())));
-	replace.push_back(make_uniq<BoundConstantExpression>(Value("\\1")));
-	replace.push_back(make_uniq<BoundConstantExpression>(Value("g")));
-	FunctionBinder function_binder(context);
-	text = make_uniq<BoundCaseExpression>(
-	    function_binder.BindScalarFunction(Identifier::DefaultSchema(), Identifier("contains"), std::move(contains)),
-	    function_binder.BindScalarFunction(Identifier::DefaultSchema(), Identifier("regexp_replace"),
-	                                       std::move(replace)),
-	    std::move(text));
+	MultiFileReader::FinalizeChunk(context, bind_data, reader, reader_data, input_chunk, output_chunk, executor,
+	                               global_state);
 }
 
 ReaderInitializeType HiveMultiFileReader::InitializeReader(MultiFileReaderData &reader_data,
@@ -1779,12 +1775,12 @@ ReaderInitializeType HiveMultiFileReader::InitializeReader(MultiFileReaderData &
 		throw InternalException("Hive text table '%s': a filter was pushed into read_csv", ScanInfo().Describe());
 	}
 	auto &csv_options = ScanInfo().csv_options;
+	if (csv_options.line_fields) {
+		ReadOpenCSVLines(*reader_data.reader);
+	}
 	for (auto &expr : reader_data.expressions) {
 		if (!expr) {
 			continue;
-		}
-		if (!csv_options.field_escape.empty()) {
-			UnescapeField(context, expr, csv_options);
 		}
 		switch (csv_options.FieldConversion(expr->GetReturnType())) {
 		case HiveFieldConversion::NONE:
@@ -1870,26 +1866,41 @@ static unique_ptr<ParsedExpression> BarredField(const Identifier &name) {
 	return make_uniq<FunctionExpression>(Identifier("__internal_barrier"), std::move(field));
 }
 
-//! A field's text with the escape character read_csv does not apply dropped, as InitializeReader reads it
-static unique_ptr<ParsedExpression> UnescapedField(const HiveCSVOptions &options, unique_ptr<ParsedExpression> field) {
-	if (options.field_escape.empty()) {
-		return field;
+//! A field of the files as the reader call reads it: the column read_csv returns, barred, or with line_fields the field
+//! hive_opencsv_field splits from the line read_csv returns split at its NUL bytes, as InitializeReader reads it
+static unique_ptr<ParsedExpression> ReaderField(const HiveScanInfo &info, const Identifier &name, bool barred) {
+	auto &options = info.csv_options;
+	if (!options.line_fields) {
+		return barred ? BarredField(name) : make_uniq<ColumnRefExpression>(name);
 	}
-	vector<unique_ptr<ParsedExpression>> contains;
-	contains.push_back(field->Copy());
-	contains.push_back(ConstantExpression::FromValue(Value(options.field_escape)));
-	vector<unique_ptr<ParsedExpression>> replace;
-	replace.push_back(field->Copy());
-	replace.push_back(ConstantExpression::FromValue(Value(options.FieldEscapePattern())));
-	replace.push_back(ConstantExpression::FromValue(Value("\\1")));
-	replace.push_back(ConstantExpression::FromValue(Value("g")));
-	auto unescaped = make_uniq<CaseExpression>();
-	CaseCheck check;
-	check.when_expr = make_uniq<FunctionExpression>(Identifier("contains"), std::move(contains));
-	check.then_expr = make_uniq<FunctionExpression>(Identifier("regexp_replace"), std::move(replace));
-	unescaped->CaseChecksMutable().push_back(std::move(check));
-	unescaped->ElseMutable() = std::move(field);
-	return std::move(unescaped);
+	vector<unique_ptr<ParsedExpression>> pieces;
+	int64_t field = 0;
+	for (auto &column : info.names) {
+		if (info.GetPartitionKeyIndex(column.GetIdentifierName()) != DConstants::INVALID_INDEX) {
+			continue;
+		}
+		if (StringUtil::CIEquals(column.GetIdentifierName(), name.GetIdentifierName())) {
+			field = NumericCast<int64_t>(pieces.size());
+		}
+		pieces.push_back(make_uniq<ColumnRefExpression>(column));
+	}
+	unique_ptr<ParsedExpression> line;
+	if (pieces.size() == 1) {
+		line = std::move(pieces[0]);
+	} else {
+		// read_csv pads the columns after a line's last piece with NULL, which concat_ws skips
+		vector<unique_ptr<ParsedExpression>> nul;
+		nul.push_back(ConstantExpression::FromValue(Value::INTEGER(0)));
+		pieces.insert(pieces.begin(), make_uniq<FunctionExpression>(Identifier("chr"), std::move(nul)));
+		line = make_uniq<FunctionExpression>(Identifier("concat_ws"), std::move(pieces));
+	}
+	vector<unique_ptr<ParsedExpression>> children;
+	children.push_back(std::move(line));
+	children.push_back(ConstantExpression::FromValue(Value::BIGINT(field)));
+	children.push_back(ConstantExpression::FromValue(Value(options.delimiter)));
+	children.push_back(ConstantExpression::FromValue(Value(options.quote)));
+	children.push_back(ConstantExpression::FromValue(Value(options.escape)));
+	return make_uniq<FunctionExpression>(Identifier("hive_opencsv_field"), std::move(children));
 }
 
 //! A data column of the scan, of the table's type, as an expression over the reader's column: the conversion of a field
@@ -1904,20 +1915,20 @@ static unique_ptr<ParsedExpression> ReaderColumn(const HiveScanInfo &info, const
 	auto conversion = options.FieldConversion(type);
 	switch (conversion) {
 	case HiveFieldConversion::NONE:
-		if (options.field_escape.empty()) {
+		if (!options.line_fields) {
 			return make_uniq<ColumnRefExpression>(name);
 		}
-		column = UnescapedField(options, make_uniq<ColumnRefExpression>(name));
+		column = ReaderField(info, name, false);
 		break;
 	case HiveFieldConversion::CAST:
-		column = make_uniq<CastExpression>(type, UnescapedField(options, BarredField(name)), false);
+		column = make_uniq<CastExpression>(type, ReaderField(info, name, true), false);
 		break;
 	case HiveFieldConversion::TRY_CAST:
-		column = make_uniq<CastExpression>(type, UnescapedField(options, BarredField(name)), true);
+		column = make_uniq<CastExpression>(type, ReaderField(info, name, true), true);
 		break;
 	case HiveFieldConversion::FALSE_UNLESS_TRUE: {
 		vector<unique_ptr<ParsedExpression>> lower;
-		lower.push_back(UnescapedField(options, BarredField(name)));
+		lower.push_back(ReaderField(info, name, true));
 		column = make_uniq<ComparisonExpression>(ExpressionType::COMPARE_EQUAL,
 		                                         make_uniq<FunctionExpression>(Identifier("lower"), std::move(lower)),
 		                                         ConstantExpression::FromValue(Value("true")));
@@ -1926,9 +1937,9 @@ static unique_ptr<ParsedExpression> ReaderColumn(const HiveScanInfo &info, const
 	case HiveFieldConversion::EPOCH:
 	case HiveFieldConversion::TRY_EPOCH: {
 		auto is_date = type == LogicalType::DATE;
-		auto number = make_uniq<CastExpression>(is_date ? LogicalType::INTEGER : LogicalType::BIGINT,
-		                                        UnescapedField(options, BarredField(name)),
-		                                        conversion == HiveFieldConversion::TRY_EPOCH);
+		auto number =
+		    make_uniq<CastExpression>(is_date ? LogicalType::INTEGER : LogicalType::BIGINT,
+		                              ReaderField(info, name, true), conversion == HiveFieldConversion::TRY_EPOCH);
 		vector<unique_ptr<ParsedExpression>> children;
 		if (is_date) {
 			children.push_back(ConstantExpression::FromValue(Value::DATE(date_t::epoch())));

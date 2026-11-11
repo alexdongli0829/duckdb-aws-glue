@@ -2,7 +2,6 @@
 
 #include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
-#include "re2/re2.h"
 #include "duckdb/common/types.hpp"
 
 namespace duckdb {
@@ -21,16 +20,11 @@ HiveFieldConversion HiveCSVOptions::FieldConversion(const LogicalType &type) con
 	return null_for_invalid_data ? HiveFieldConversion::TRY_CAST : HiveFieldConversion::CAST;
 }
 
-string HiveCSVOptions::FieldEscapePattern() const {
-	return duckdb_re2::RE2::QuoteMeta(field_escape) + "([" + duckdb_re2::RE2::QuoteMeta(field_escape) +
-	       duckdb_re2::RE2::QuoteMeta(quote) + "])?";
-}
-
 bool HiveCSVOptions::operator==(const HiveCSVOptions &other) const {
 	return delimiter == other.delimiter && quote == other.quote && escape == other.escape &&
 	       skip_lines == other.skip_lines && null_string == other.null_string && serde_fields == other.serde_fields &&
 	       null_for_invalid_data == other.null_for_invalid_data && false_unless_true == other.false_unless_true &&
-	       field_escape == other.field_escape && epoch_fields == other.epoch_fields;
+	       field_escape == other.field_escape && epoch_fields == other.epoch_fields && line_fields == other.line_fields;
 }
 
 bool HiveCSVOptions::operator!=(const HiveCSVOptions &other) const {
@@ -48,6 +42,7 @@ void HiveCSVOptions::Serialize(Serializer &serializer) const {
 	serializer.WritePropertyWithDefault<bool>(107, "false_unless_true", false_unless_true, false);
 	serializer.WritePropertyWithDefault<bool>(108, "epoch_fields", epoch_fields, false);
 	serializer.WritePropertyWithDefault<string>(109, "field_escape", field_escape, string());
+	serializer.WritePropertyWithDefault<bool>(110, "line_fields", line_fields, false);
 }
 
 HiveCSVOptions HiveCSVOptions::Deserialize(Deserializer &deserializer) {
@@ -63,6 +58,7 @@ HiveCSVOptions HiveCSVOptions::Deserialize(Deserializer &deserializer) {
 	result.false_unless_true = deserializer.ReadPropertyWithExplicitDefault<bool>(107, "false_unless_true", false);
 	result.epoch_fields = deserializer.ReadPropertyWithExplicitDefault<bool>(108, "epoch_fields", false);
 	result.field_escape = deserializer.ReadPropertyWithExplicitDefault<string>(109, "field_escape", string());
+	result.line_fields = deserializer.ReadPropertyWithExplicitDefault<bool>(110, "line_fields", false);
 	return result;
 }
 
