@@ -206,7 +206,7 @@ has 'skip.footer.line.count' set, which DuckDB can not read or write
 #---------------------------------------------------------------------------
 # tables this extension writes; a table property overrides the SerDe property of the same name
 #---------------------------------------------------------------------------
-foreach table formats_csv_byte_delim formats_csv_empty_null formats_csv_backslash_n formats_csv_opencsv formats_csv_opencsv_bool formats_csv_opencsv_escape formats_csv_opencsv_escape_same formats_csv_opencsv_backslash formats_csv_opencsv_backslash_text formats_csv_opencsv_nul formats_csv_opencsv_nul_plain formats_csv_wide_escape formats_csv_wide_plain formats_csv_header_ctas formats_csv_bad formats_csv_signed_delim formats_csv_wide formats_csv_nested formats_csv_zeros
+foreach table formats_csv_byte_delim formats_csv_empty_null formats_csv_backslash_n formats_csv_opencsv formats_csv_opencsv_bool formats_csv_opencsv_escape formats_csv_opencsv_tilde formats_csv_opencsv_escape_same formats_csv_opencsv_backslash formats_csv_opencsv_backslash_text formats_csv_opencsv_nul formats_csv_opencsv_nul_plain formats_csv_wide_escape formats_csv_wide_plain formats_csv_header_ctas formats_csv_bad formats_csv_signed_delim formats_csv_wide formats_csv_nested formats_csv_zeros
 
 statement ok
 DROP TABLE IF EXISTS my_datalake.default.{table};
@@ -433,18 +433,22 @@ SELECT id, val FROM my_datalake.default.fixture_text_opencsv_escape_write WHERE 
 3	x\"y
 4	\\
 
-# a table this extension creates records escapeChar '"', which is read as it is: a '\' is an ordinary character, and it
-# is written as it is
+# a table this extension creates records escapeChar '"', which OpenCSVSerde reads as '\' (Hive builds its reader without
+# an escape then, and opencsv's default is '\'): so is it read here, and a written '\' is doubled to read back as one.
+# Another engine's file with a single '\' reads as OpenCSVSerde reads it
 statement ok
 CREATE TABLE my_datalake.default.formats_csv_opencsv_escape (id INTEGER, val VARCHAR) WITH (format = 'csv', quote = '"');
 
 statement ok
-INSERT INTO my_datalake.default.formats_csv_opencsv_escape VALUES (1, 'C:\dir'), (2, 'a\\b'), (3, '\');
+INSERT INTO my_datalake.default.formats_csv_opencsv_escape VALUES (1, 'C:\dir'), (2, 'a\\b'), (3, '\'), (4, 'x\"y');
 
 query I
 SELECT replace(content, chr(10), '<nl>') FROM read_text('{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/formats_csv_opencsv_escape/*.csv');
 ----
-"1","C:\dir"<nl>"2","a\\b"<nl>"3","\"<nl>
+"1","C:\\dir"<nl>"2","a\\\\b"<nl>"3","\\"<nl>"4","x\\""y"<nl>
+
+statement ok
+COPY (SELECT * FROM (VALUES ('5,"C:\dir"'), ('6,a\,b')) t(line)) TO '{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/formats_csv_opencsv_escape/other.csv' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
 
 query II
 SELECT id, val FROM my_datalake.default.formats_csv_opencsv_escape ORDER BY id;
@@ -452,6 +456,39 @@ SELECT id, val FROM my_datalake.default.formats_csv_opencsv_escape ORDER BY id;
 1	C:\dir
 2	a\\b
 3	\
+4	x\"y
+5	C:dir
+6	a
+
+query II
+EXPLAIN (SQL) SELECT val FROM my_datalake.default.formats_csv_opencsv_escape;
+----
+sql	<REGEX>:.*hive_opencsv_field\(\s*concat_ws\(chr\(0\), id, val\),\s*CAST\(1 AS BIGINT\),\s*',',\s*'"',\s*'\\'\) AS val.*
+
+# any other escapeChar is read as it is, and split as OpenCSVSerde splits: an escape before the separator is dropped,
+# where read_csv would join the fields, and an escape before any character of a field is dropped with an escape after it
+# ('~~' at the start of a field is empty); writes escape the quote and the escape character with it
+statement ok
+CREATE TABLE my_datalake.default.formats_csv_opencsv_tilde (id INTEGER, a VARCHAR, b VARCHAR, n INTEGER) WITH (format = 'csv', quote = '"', escape = '~');
+
+statement ok
+COPY (SELECT * FROM (VALUES ('1,a~,b,1'), ('2,"p~"q",~~,2'), ('3,a\b,"c\"d",3')) t(line)) TO '{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/formats_csv_opencsv_tilde/data.csv' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
+
+statement ok
+INSERT INTO my_datalake.default.formats_csv_opencsv_tilde VALUES (4, 'x"y', 'p~q', 4);
+
+query I
+SELECT replace(content, chr(10), '<nl>') FROM read_text('{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/formats_csv_opencsv_tilde/*.csv') WHERE content LIKE '"4"%';
+----
+"4","x~"y","p~~q","4"<nl>
+
+query IIII
+SELECT id, a, b, n FROM my_datalake.default.formats_csv_opencsv_tilde ORDER BY id;
+----
+1	a	b	1
+2	p"q	(empty)	2
+3	a\b	NULL	NULL
+4	x"y	p~q	4
 
 # escapeChar '\': each line is split as OpenCSVSerde splits it, where read_csv would apply the '\' before a separator or
 # a line break and join the next field or line
@@ -535,6 +572,14 @@ SELECT hive_opencsv_field('a¦"b¦c"¦d', 1, '¦', '"', '\');
 ----
 b¦c
 
+# whitespace before a quote in the middle of a field is dropped, as Java's Character.isWhitespace sees it (U+2003 is an
+# em space, U+00A0 a non-breaking space, which is not whitespace to Java)
+query IIII
+SELECT hive_opencsv_field('1, "x"', 1, ',', '"', '\'), hive_opencsv_field('1,' || chr(8195) || '"x"', 1, ',', '"', '\'),
+       hive_opencsv_field('1,' || chr(160) || '"x"', 1, ',', '"', '\') = chr(160) || '"x', hive_opencsv_field('1,a"x"', 1, ',', '"', '\');
+----
+x	x	true	a"x
+
 # values written to it read back unchanged
 statement ok
 INSERT INTO my_datalake.default.formats_csv_opencsv_backslash VALUES (20, 'q"x', 'C:\dir\'), (21, 'a,b', '\');
@@ -559,12 +604,18 @@ SELECT id, val FROM my_datalake.default.formats_csv_opencsv_backslash_text ORDER
 1	NULL
 NULL	NULL
 
-# a NUL byte is data, as OpenCSVSerde reads it, with escapeChar '\' and without escapeChar
+# a NUL byte is data, as OpenCSVSerde reads it, with any escapeChar. read_csv splits a line at its NUL bytes, which the
+# scan joins again, but it returns no more pieces than the table has columns: a value with a NUL byte can not be written
 statement ok
 CREATE TABLE my_datalake.default.formats_csv_opencsv_nul (id INTEGER, s VARCHAR, tail VARCHAR) WITH (format = 'csv', quote = '"', escape = '\');
 
+statement error
+INSERT INTO my_datalake.default.formats_csv_opencsv_nul VALUES (1, 'a' || chr(0) || 'b', 'tail');
+----
+holds a line break or a NUL byte
+
 statement ok
-INSERT INTO my_datalake.default.formats_csv_opencsv_nul VALUES (1, 'a' || chr(0) || 'b', 'tail'), (2, chr(0) || chr(0), ''), (3, chr(0), NULL);
+COPY (SELECT * FROM (VALUES ('1,"a' || chr(0) || 'b",tail'), ('2,"' || chr(0) || chr(0) || '",'), ('3,' || chr(0) || ',')) t(line)) TO '{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/formats_csv_opencsv_nul/data.csv' (FORMAT csv, HEADER false, QUOTE '', ESCAPE '');
 
 query III
 SELECT id, s = ('a' || chr(0) || 'b'), tail = 'tail' FROM my_datalake.default.formats_csv_opencsv_nul WHERE id = 1;
@@ -787,7 +838,7 @@ DROP TABLE my_datalake.default.formats_csv_bad;
 
 endloop
 
-# OpenCSVSerde refuses a separator that is the quote character
+# OpenCSVSerde refuses a separator that is the quote character, or the escape character it reads with
 statement ok
 CREATE TABLE my_datalake.default.formats_csv_bad (id INTEGER, name VARCHAR) WITH (format = 'csv', quote = '"', 'separatorChar' = '"');
 
@@ -795,6 +846,29 @@ statement error
 SELECT * FROM my_datalake.default.formats_csv_bad;
 ----
 has the same separatorChar and quoteChar
+
+statement ok
+DROP TABLE my_datalake.default.formats_csv_bad;
+
+statement ok
+CREATE TABLE my_datalake.default.formats_csv_bad (id INTEGER, name VARCHAR) WITH (format = 'csv', quote = '"', escape = '~', 'separatorChar' = '~');
+
+statement error
+SELECT * FROM my_datalake.default.formats_csv_bad;
+----
+has its separatorChar as the escape character it is read with ('~')
+
+statement ok
+DROP TABLE my_datalake.default.formats_csv_bad;
+
+# without escapeChar the escape is '\', which the quote character can not be then
+statement ok
+CREATE TABLE my_datalake.default.formats_csv_bad (id INTEGER, name VARCHAR) WITH (format = 'csv', quote = '"', 'quoteChar' = '\', 'escapeChar' = '');
+
+statement error
+SELECT * FROM my_datalake.default.formats_csv_bad;
+----
+has its quoteChar as the escape character it is read with ('\')
 
 statement ok
 DROP TABLE my_datalake.default.formats_csv_bad;
@@ -880,7 +954,7 @@ DROP TABLE my_datalake.default.formats_json_lines;
 
 endloop
 
-foreach table formats_csv_two_headers formats_csv_footer formats_csv_byte_delim formats_csv_empty_null formats_csv_backslash_n formats_csv_opencsv formats_csv_opencsv_bool formats_csv_opencsv_escape formats_csv_opencsv_backslash formats_csv_opencsv_backslash_text formats_csv_opencsv_nul formats_csv_opencsv_nul_plain formats_csv_header_ctas
+foreach table formats_csv_two_headers formats_csv_footer formats_csv_byte_delim formats_csv_empty_null formats_csv_backslash_n formats_csv_opencsv formats_csv_opencsv_bool formats_csv_opencsv_escape formats_csv_opencsv_tilde formats_csv_opencsv_backslash formats_csv_opencsv_backslash_text formats_csv_opencsv_nul formats_csv_opencsv_nul_plain formats_csv_header_ctas
 
 statement ok
 DROP TABLE my_datalake.default.{table};

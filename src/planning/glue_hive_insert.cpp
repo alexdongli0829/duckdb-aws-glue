@@ -477,11 +477,12 @@ void GlueHiveInsert::PlanWrite(ClientContext &context, PhysicalPlanGenerator &pl
 			// as Hive writes OpenCSVSerde files, so that an escape character in a value is escaped too
 			copy_options[Identifier("force_quote")] = {Value("*")};
 		}
-		// every data column is written as text, refused where a field of the table's files can not hold it
-		string forbidden = quoted || !escape.empty() ? "\n\r" : "\n\r" + delimiter;
+		// every data column is written as text, refused where a field of the table's files can not hold it; a NUL byte
+		// splits a line of an OpenCSVSerde file as read_csv reads it (the delimiter it is given, hive_csv_options.hpp)
+		string forbidden = quoted ? string("\n\r\0", 3) : !escape.empty() ? "\n\r" : "\n\r" + delimiter;
 		string reason;
 		if (quoted) {
-			reason = "holds a line break";
+			reason = "holds a line break or a NUL byte";
 		} else if (!escape.empty()) {
 			reason = StringUtil::Format("holds a line break or is the table's NULL string '%s'", null_string);
 		} else {
@@ -492,6 +493,9 @@ void GlueHiveInsert::PlanWrite(ClientContext &context, PhysicalPlanGenerator &pl
 		vector<unique_ptr<Expression>> select_list;
 		vector<LogicalType> projected_types;
 		auto csv_options = table_info.GetCSVOptions();
+		// OpenCSVSerde reads with '\' a file written with the quote character as its escape (GetOpenCSVReadEscape): a
+		// '\' in a value is doubled then, so that it reads back as one
+		auto doubled = quoted && csv_options.escape != table_info.GetEscapeCharacter() ? csv_options.escape : string();
 		for (idx_t i = 0; i < names.size(); i++) {
 			unique_ptr<Expression> column = make_uniq<BoundReferenceExpression>(types[i], i);
 			if (std::find(partition_columns.begin(), partition_columns.end(), i) == partition_columns.end()) {
@@ -513,8 +517,8 @@ void GlueHiveInsert::PlanWrite(ClientContext &context, PhysicalPlanGenerator &pl
 				    CheckedTextField(context, std::move(column), forbidden, quoted ? nullptr : &null_string, message);
 				if (!escape.empty()) {
 					column = EscapedTextField(context, std::move(column), escape, delimiter);
-				} else if (!csv_options.field_escape.empty()) {
-					column = EscapedTextField(context, std::move(column), csv_options.field_escape, string());
+				} else if (!doubled.empty()) {
+					column = EscapedTextField(context, std::move(column), doubled, string());
 				}
 				copy_types[i] = LogicalType::VARCHAR;
 			}

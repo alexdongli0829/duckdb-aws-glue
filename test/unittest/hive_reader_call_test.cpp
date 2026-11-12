@@ -454,7 +454,8 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 		scan.Retype("name", LogicalType::INTEGER);
 		REQUIRE(!HiveScanGetReaderCall(scan.Get()).has_value());
 	}
-	// OpenCSVSerde: quoted, one header line, no NULL, and a value that does not parse fails the query
+	// OpenCSVSerde: quoted, one header line, no NULL, and a value that does not parse fails the query; the lines are split
+	// as OpenCSVSerde splits them (escapeChar '"' is read as '\')
 	auto opencsv = tables.Add("opencsv");
 	Run(con, "CREATE TABLE lake.default." + opencsv +
 	             " (id INTEGER, name VARCHAR, amount DOUBLE) WITH (format = 'csv', quote = '\"', "
@@ -464,7 +465,8 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	           opencsv_location + "/data.csv");
 	query = "SELECT * FROM lake.default." + opencsv;
 	read = Restate(con, query);
-	REQUIRE(StringUtil::Contains(read, "CAST(__internal_barrier(amount) AS DOUBLE)"));
+	REQUIRE(StringUtil::Contains(read, "CAST(hive_opencsv_field(concat_ws(chr(0), id, \"name\", amount), CAST(2 AS "
+	                                   "BIGINT), ',', '\"', '\\') AS DOUBLE)"));
 	REQUIRE(!StringUtil::Contains(read, "TRY_CAST"));
 	REQUIRE(Rows(con, read) == 4);
 	REQUIRE(Differences(con, query, read) == 0);
@@ -473,17 +475,19 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	REQUIRE(StringUtil::Contains(ReadError(con, Restate(con, query)), "Could not convert string 'oops' to DOUBLE"));
 	Run(con, "ALTER TABLE lake.default." + opencsv + " SET ('use.null.for.invalid.data' = 'true')");
 	read = Restate(con, query);
-	REQUIRE(StringUtil::Contains(read, "TRY_CAST(__internal_barrier(amount) AS DOUBLE)"));
+	REQUIRE(StringUtil::Contains(read, "TRY_CAST(hive_opencsv_field(concat_ws(chr(0), id, \"name\", amount), CAST(2 AS "
+	                                   "BIGINT), ',', '\"', '\\') AS DOUBLE)"));
 	REQUIRE(Rows(con, read) == 5);
 	REQUIRE(Differences(con, query, read) == 0);
-	// a quoted line break: planned with hive_csv_parallel off, the read is sent to a session that has it on
+	// a quoted line break ends the line, as Hive splits the records before OpenCSVSerde parses them: two broken rows,
+	// the same in the scan and the reader call, whatever hive_csv_parallel says (it concerns a scan read_csv splits)
 	WriteLines(con, {"id,name,amount", "6,\"two\nlines\",6.5", "7"}, opencsv_location + "/line_break.csv");
 	Run(con, "SET hive_csv_parallel = false");
 	read = Restate(con, query);
 	Run(con, "RESET hive_csv_parallel");
-	REQUIRE(StringUtil::Contains(read, "\"parallel\" := false"));
-	REQUIRE(StringUtil::Contains(ReadError(con, query), "parallel scanner does not support null_padding"));
-	REQUIRE(Rows(con, read) == 7);
+	REQUIRE(!StringUtil::Contains(read, "parallel"));
+	REQUIRE(Rows(con, read) == 8);
+	REQUIRE(Differences(con, query, read) == 0);
 	// an OpenCSVSerde boolean is true for 'true' in any case and false otherwise, never an error
 	auto flags = tables.Add("flags");
 	Run(con, "CREATE TABLE lake.default." + flags + " (id INTEGER, ok BOOLEAN) WITH (format = 'csv', quote = '\"')");
@@ -493,7 +497,7 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	{
 		PlannedScan scan(con, query);
 		REQUIRE(Columns(Call(scan)) ==
-		        vector<string> {"CAST(__internal_barrier(id) AS INTEGER)", "(lower(__internal_barrier(ok)) = 'true')"});
+		        vector<string> {"CAST(hive_opencsv_field(concat_ws(chr(0), id, ok), CAST(0 AS BIGINT), ',', '\"', '\\') AS INTEGER)", "(lower(hive_opencsv_field(concat_ws(chr(0), id, ok), CAST(1 AS BIGINT), ',', '\"', '\\')) = 'true')"});
 	}
 	read = Restate(con, query);
 	REQUIRE(Scalar(con,
@@ -510,9 +514,8 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	{
 		PlannedScan scan(con, query);
 		REQUIRE(Columns(Call(scan)) ==
-		        vector<string> {"CAST(__internal_barrier(id) AS INTEGER)",
-		                        "make_timestamp_ms(CAST(__internal_barrier(ts) AS BIGINT))",
-		                        "(CAST('1970-01-01' AS DATE) + CAST(__internal_barrier(d) AS INTEGER))"});
+		        vector<string> {"CAST(hive_opencsv_field(concat_ws(chr(0), id, ts, d), CAST(0 AS BIGINT), ',', '\"', '\\') AS INTEGER)", "make_timestamp_ms(CAST(hive_opencsv_field(concat_ws(chr(0), id, ts, d), CAST(1 AS BIGINT), ',', '\"', '\\') AS BIGINT))",
+		                        "(CAST('1970-01-01' AS DATE) + CAST(hive_opencsv_field(concat_ws(chr(0), id, ts, d), CAST(2 AS BIGINT), ',', '\"', '\\') AS INTEGER))"});
 	}
 	read = Restate(con, query);
 	REQUIRE(Scalar(con, "SELECT string_agg(id || ':' || coalesce(ts::VARCHAR, 'NULL') || ':' || coalesce(d::VARCHAR, "
@@ -528,8 +531,8 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	{
 		PlannedScan scan(con, query);
 		auto columns = Columns(Call(scan));
-		REQUIRE(columns[1] == "TRY(make_timestamp_ms(TRY_CAST(__internal_barrier(ts) AS BIGINT)))");
-		REQUIRE(columns[2] == "TRY((CAST('1970-01-01' AS DATE) + TRY_CAST(__internal_barrier(d) AS INTEGER)))");
+		REQUIRE(columns[1] == "TRY(make_timestamp_ms(TRY_CAST(hive_opencsv_field(concat_ws(chr(0), id, ts, d), CAST(1 AS BIGINT), ',', '\"', '\\') AS BIGINT)))");
+		REQUIRE(columns[2] == "TRY((CAST('1970-01-01' AS DATE) + TRY_CAST(hive_opencsv_field(concat_ws(chr(0), id, ts, d), CAST(2 AS BIGINT), ',', '\"', '\\') AS INTEGER)))");
 	}
 	read = Restate(con, query);
 	REQUIRE(Rows(con, read) == 5);
@@ -537,7 +540,8 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 	        "1");
 	REQUIRE(Differences(con, query, read) == 0);
 	// OpenCSVSerde with escapeChar '\' or without escapeChar: read_csv returns each line split only at its NUL bytes,
-	// which the reader call joins and splits with hive_opencsv_field as the scan does
+	// which the reader call joins and splits with hive_opencsv_field as the scan does; a NUL byte is data in a file
+	// another writer left (a written value may not hold one)
 	for (auto escape_set : {true, false}) {
 		auto escaped = tables.Add(escape_set ? "backslash" : "no_escape");
 		Run(con, "CREATE TABLE lake.default." + escaped +
@@ -547,7 +551,12 @@ TEST_CASE("Glue tables of every SerDe are restated", "[hive_reader_call][glue_ca
 		}
 		WriteLines(con, {"1,\"a\\\"b\",1", "2,a\\\\b,2", "3,\"x,y\",3", "4,\\,4", "5", "6,\"open"},
 		           location + "/default/" + escaped + "/data.csv");
-		Run(con, "INSERT INTO lake.default." + escaped + " VALUES (7, 'a' || chr(0) || 'b', 7), (8, 'c\\d', 8)");
+		Write(con, "SELECT '7,\"a' || chr(0) || 'b\",7' AS line", location + "/default/" + escaped + "/nul.csv",
+		      "FORMAT csv, HEADER false, QUOTE '', ESCAPE ''");
+		REQUIRE(StringUtil::Contains(
+		    con.Query("INSERT INTO lake.default." + escaped + " VALUES (7, 'a' || chr(0) || 'b', 7)")->GetError(),
+		    "holds a line break or a NUL byte"));
+		Run(con, "INSERT INTO lake.default." + escaped + " VALUES (8, 'c\\d', 8)");
 		auto escaped_query = "SELECT * FROM lake.default." + escaped;
 		{
 			PlannedScan scan(con, escaped_query);

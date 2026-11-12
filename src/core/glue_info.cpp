@@ -245,8 +245,17 @@ void GlueTableInfo::CheckTextSerdeSupported(HiveFileFormat format) const {
 		if (GetQuoteCharacter().size() > 1 || GetEscapeCharacter().size() > 1) {
 			refuse("has a quoteChar or escapeChar of more than one byte");
 		}
+		// opencsv refuses a parser whose separator, quote and escape are not all different
 		if (GetFieldDelimiter() == GetQuoteCharacter()) {
 			refuse("has the same separatorChar and quoteChar");
+		}
+		auto read_escape = GetOpenCSVReadEscape();
+		if (GetFieldDelimiter() == read_escape) {
+			refuse(StringUtil::Format("has its separatorChar as the escape character it is read with ('%s')",
+			                          read_escape));
+		}
+		if (GetQuoteCharacter() == read_escape) {
+			refuse(StringUtil::Format("has its quoteChar as the escape character it is read with ('%s')", read_escape));
 		}
 		return;
 	}
@@ -343,6 +352,15 @@ string GlueTableInfo::GetEscapeCharacter() const {
 	return string();
 }
 
+string GlueTableInfo::GetOpenCSVReadEscape() const {
+	// OpenCSVSerde.newReader: an escapeChar of '"' (CSVWriter.DEFAULT_ESCAPE_CHARACTER, also the default when not
+	// set) builds the reader without an escape, so opencsv's default '\' applies. The same for an escapeChar that is
+	// the quote character, which this extension records for its own tables and OpenCSVSerde would refuse
+	auto quote = GetQuoteCharacter();
+	auto escape = GetOpenCSVCharacter("escapeChar", "\"");
+	return escape == "\"" || escape == quote ? "\\" : escape;
+}
+
 HiveCSVOptions GlueTableInfo::GetCSVOptions() const {
 	HiveCSVOptions options;
 	options.delimiter = GetFieldDelimiter();
@@ -358,19 +376,12 @@ HiveCSVOptions GlueTableInfo::GetCSVOptions() const {
 	                                          StringUtil::CIEquals(null_for_invalid_data, "true"));
 	options.false_unless_true = GetSerDe() == HiveSerDe::OPEN_CSV;
 	options.epoch_fields = GetSerDe() == HiveSerDe::OPEN_CSV;
-	// without escapeChar OpenCSVSerde reads with a '\' escape, as with escapeChar '\', which read_csv does not apply as
-	// it does: the lines are split by SplitOpenCSVLine instead; an explicit escapeChar '"', which this extension
-	// writes, is read as it is
-	string escape_char;
-	auto escape_set = TryGetProperty("escapeChar", escape_char) && !escape_char.empty();
-	if (GetSerDe() == HiveSerDe::OPEN_CSV && (!escape_set || options.escape == "\\") && options.delimiter != "\\" &&
-	    options.quote != "\\") {
-		if (!escape_set) {
-			// written with the quote character as the escape, so a '\' is doubled
-			options.field_escape = "\\";
-		}
+	if (GetSerDe() == HiveSerDe::OPEN_CSV) {
+		// read_csv applies an escape character before a separator or a line break too, and a doubled quote only when
+		// the escape is the quote character, where OpenCSVSerde drops the escape and reads a doubled quote as one
+		// whatever the escape: the lines are split as OpenCSVSerde splits them (SplitOpenCSVLine) instead
+		options.escape = GetOpenCSVReadEscape();
 		options.line_fields = true;
-		options.escape = "\\";
 	}
 	return options;
 }

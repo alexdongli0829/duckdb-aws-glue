@@ -96,24 +96,20 @@ TO '{DEFAULT_S3_LOCATION}/{TEST_DIR}/default/es_opencsv/dt=2016-05-14/more.csv' 
 query II
 EXPLAIN (SQL) SELECT * FROM my_datalake.default.es_opencsv;
 ----
-sql	<REGEX>:.*SELECT\s+CAST\(__internal_barrier\(id\) AS INTEGER\) AS id,\s+"name",\s+\(lower\(__internal_barrier\(flag\)\) = 'true'\) AS flag,\s+'2016-05-14' AS dt\s+FROM "system"\.main\.read_csv\(.*\("quote" = CAST\('"' AS VARCHAR\)\).*
+sql	<REGEX>:.*SELECT\s+CAST\(hive_opencsv_field\(concat_ws\(chr\(0\), id, "name", flag\), CAST\(0 AS BIGINT\), ',', '"', '\\'\) AS INTEGER\) AS id,\s+hive_opencsv_field\(\s*concat_ws\(chr\(0\), id, "name", flag\),\s*CAST\(1 AS BIGINT\),\s*',',\s*'"',\s*'\\'\) AS "name",\s+\(lower\(hive_opencsv_field\(concat_ws\(chr\(0\), id, "name", flag\), CAST\(2 AS BIGINT\), ',', '"', '\\'\)\) = 'true'\) AS flag,\s+'2016-05-14' AS dt\s+FROM "system"\.main\.read_csv\(.*\(delim = CAST\('' AS VARCHAR\)\).*\("quote" = CAST\('' AS VARCHAR\)\).*
 
-# one thread per file, as the planning session has it
+# hive_csv_parallel concerns a scan read_csv splits (hive_scan with a quote): the lines of an OpenCSVSerde table are
+# split by the scan, at no risk of a quoted line break
 statement ok
 SET hive_csv_parallel = false;
 
 query II
 EXPLAIN (SQL) SELECT * FROM my_datalake.default.es_opencsv;
 ----
-sql	<REGEX>:.*FROM "system"\.main\.read_csv\(.*\("?parallel"? = CAST\(FALSE AS BOOLEAN\)\).*
+sql	<!REGEX>:.*parallel.*
 
 statement ok
 RESET hive_csv_parallel;
-
-query II
-EXPLAIN (SQL) SELECT * FROM my_datalake.default.es_opencsv;
-----
-sql	<!REGEX>:.*parallel.*
 
 # JsonSerDe
 statement ok
@@ -238,7 +234,7 @@ ALTER TABLE my_datalake.default.es_opencsv SET ('use.null.for.invalid.data' = 't
 query II
 EXPLAIN (SQL) SELECT * FROM my_datalake.default.es_opencsv;
 ----
-sql	<REGEX>:.*SELECT\s+TRY_CAST\(__internal_barrier\(id\) AS INTEGER\) AS id,\s+.*
+sql	<REGEX>:.*SELECT\s+TRY_CAST\(hive_opencsv_field\(concat_ws\(chr\(0\), id, "name", flag\), CAST\(0 AS BIGINT\), ',', '"', '\\'\) AS INTEGER\) AS id,\s+.*
 
 # a line of a JsonSerDe table that is not JSON fails the read
 statement ok

@@ -152,8 +152,12 @@ public:
 	void CheckTextSerdeSupported(HiveFileFormat format) const;
 	//! OpenCSVSerde's quoteChar ('"' by default); empty for LazySimpleSerDe, which does not quote
 	string GetQuoteCharacter() const;
-	//! OpenCSVSerde's escapeChar, else its quote character; LazySimpleSerDe's escape.delim (empty without)
+	//! The escape character the table's files are written with: OpenCSVSerde's escapeChar, else its quote character;
+	//! LazySimpleSerDe's escape.delim (empty without)
 	string GetEscapeCharacter() const;
+	//! The escape character OpenCSVSerde reads the table's files with: escapeChar, unless it is not set, '"' or the
+	//! quote character, when it is '\' (Hive then builds its reader without an escape, and opencsv's default is '\')
+	string GetOpenCSVReadEscape() const;
 	//! How the files of a csv table are read
 	HiveCSVOptions GetCSVOptions() const;
 	//! How the files of a json table are read

@@ -44,12 +44,10 @@ struct HiveCSVOptions {
 	bool null_for_invalid_data = true;
 	//! With serde_fields: a boolean field is true when it is 'true' in any case and false otherwise, never an error
 	bool false_unless_true = false;
-	//! With serde_fields: an escape character the table is read with but not written with, doubled in a written value
-	string field_escape;
 	//! With serde_fields: a timestamp field is a number of milliseconds, a date field a number of days since the epoch
 	bool epoch_fields = false;
 	//! With serde_fields: read_csv splits each line only at its NUL bytes, and the line is split as OpenCSVSerde
-	//! splits it (SplitOpenCSVLine) with the delimiter, quote and escape character
+	//! splits it (SplitOpenCSVLine) with the delimiter, quote and escape character, which read_csv applies differently
 	bool line_fields = false;
 
 public:

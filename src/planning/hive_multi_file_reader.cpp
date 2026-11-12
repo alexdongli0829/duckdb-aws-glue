@@ -65,7 +65,7 @@
 #include "duckdb/planner/sql_export_helpers.hpp"
 #include "catalog/glue_table.hpp"
 #include "core/glue_types.hpp"
-#include "core/readers/opencsv_line.hpp"
+#include "planning/opencsv_line_reader.hpp"
 #include "functions/hive_reader_call.hpp"
 
 namespace duckdb {

@@ -47,21 +47,22 @@ Text tables are read the way their SerDe reads them:
 - LazySimpleSerDe: the delimiter is `field.delim`, else `serialization.format`, else `\001`; a number from -128 to 127
   is a byte code (`'1'` is `\001`, `'9'` a tab). NULL is `serialization.null.format`, `\N` by default. Fields are not
   quoted.
-- OpenCSVSerde: `separatorChar` (`,`), `quoteChar` (`"`) and `escapeChar` (`\` when the table has none; doubled quotes
-  are read either way). Without `escapeChar`, as with `escapeChar` `\`, each line is split into its fields as
-  OpenCSVSerde splits it (`SplitOpenCSVLine`): the `\` is dropped and the `\` or quote character after it is kept, in a
-  quoted field or not (`\` is an empty field, `a\x` is `ax`, `a\\b` is `a\b`, `"a\"b"` is `a"b`), a `\` before the
-  separator or the end of the line is dropped too (`a\,b` is the fields `a` and `b`), and a line break ends the line,
-  inside quotes too, as OpenCSVSerde reads it. A NUL byte is data, as in any field, unless a line holds at least as many
-  NUL bytes as the table has data columns: what follows that many is dropped. Another `escapeChar`, such as the `"` of
-  the tables this extension creates, is applied by `read_csv` (OpenCSVSerde reads `"` as `\` too). A separator of more
-  than one byte (a non-ASCII character such as `¦`) is split on as any other. An empty field is an empty string; there
-  is no NULL. In a table `read_csv` splits, a line break inside a quoted field fails a
-  scan of at most twice `threads` files, which reads each file with several threads (`The parallel scanner does not
-  support null_padding in conjunction with quoted new lines`); with more files DuckDB reads one thread per file and
-  the field is read as one value, as CSV defines it. `SET hive_csv_parallel = false` reads one thread per file in
-  every scan. Hive and Athena v3 split the record at the line break first (TextInputFormat) and return two broken
-  rows, a difference this extension does not reproduce. A boolean field is true when it is `true` in any case and
+- OpenCSVSerde: `separatorChar` (`,`), `quoteChar` (`"`) and `escapeChar`. The escape character the files are read
+  with is `escapeChar`, unless it is not set, `"` or the quote character: then it is `\` (Hive builds its reader
+  without an escape in that case, and opencsv's default is `\`), so the `"` of the tables this extension creates reads
+  as `\` too. Each line is split into its fields as OpenCSVSerde splits it (`SplitOpenCSVLine`): the escape is dropped
+  and the escape or quote character after it is kept, in a quoted field or not (`\` is an empty field, `a\x` is `ax`,
+  `a\\b` is `a\b`, `"a\"b"` is `a"b`), an escape before any character of a field is dropped with an escape after it
+  (`\\x` is `x`), an escape before the separator or the end of the line is dropped too (`a\,b` is the fields `a`
+  and `b`), a doubled quote is one quote whatever the escape, a quote in the middle of a field is a literal character
+  (`ab"cd"ef`; whitespace before it is dropped, as Java's `Character.isWhitespace` sees it), an unclosed quote leaves
+  the line's last field NULL, and a line break ends the line, inside quotes too, as Hive's TextInputFormat splits the
+  records before OpenCSVSerde parses them (`"two<LF>lines"` is two broken rows). A NUL byte is data, as in any field,
+  unless a line holds at least as many NUL bytes as the table has data columns: what follows that many is dropped. A
+  separator of more than one byte (a non-ASCII character such as `¦`) is split on as any other. A table whose
+  separator is the quote character or the escape character it is read with, or whose quote character is that escape
+  (a `quoteChar` of `\` without `escapeChar`), is refused, as OpenCSVSerde refuses it. An empty field is an empty
+  string; there is no NULL. A boolean field is true when it is `true` in any case and
   false otherwise. A timestamp field is a number of milliseconds since the epoch (`1579059880000` is `2020-01-15
   03:44:40`) and a date field a number of days since the epoch (`18276` is `2020-01-15`); text such as `2020-01-15
   03:44:40` or `2020-01-15` does not parse.
@@ -73,7 +74,9 @@ Text tables are read the way their SerDe reads them:
 - `skip.header.line.count` lines are skipped at the start of every file.
 - A line may be up to `hive_csv_max_line_size` bytes long (default 8000000; Hive has no limit); a longer line fails
   the query. Up to the default the reader's buffers and how a file is split between threads are unchanged; a larger
-  limit makes each thread read at least that many bytes.
+  limit makes each thread read at least that many bytes. `SET hive_csv_parallel = false` reads one thread per file in
+  a `hive_scan()` with a quote character, which a file with a line break inside a quoted field needs there; the lines
+  of an OpenCSVSerde table are split by the scan and read the same either way.
 - OpenX JsonSerDe: with `ignore.malformed.json` or `use.null.for.invalid.data` set to `true` the files are read with
   `read_json(ignore_errors := true)`: a line that is not valid JSON is a row of NULLs and a value that does not fit
   its column is NULL; either property enables both. Other JsonSerDe properties that change how the files are read
@@ -83,13 +86,15 @@ Text tables are read the way their SerDe reads them:
   with `case.insensitive=false` matches them exactly. Keys of one object that differ only in case are duplicate keys.
 - Writes produce files that read back unchanged: LazySimpleSerDe values are unquoted and refused if they hold the
   delimiter or a line break, or equal the NULL string; OpenCSVSerde values are all quoted and refused if they hold a
-  line break; timestamps and dates are written as milliseconds (truncated) and days since the epoch (an infinite value
-  is refused), and a `\` is doubled in a table without `escapeChar`, which reads with the `\` escape. NULL is written
+  line break or a NUL byte; timestamps and dates are written as milliseconds (truncated) and days since the epoch (an
+  infinite value is refused). The files are written with `escapeChar`, else the quote character, as their escape, as
+  Hive writes them: where that is not the escape OpenCSVSerde reads with (`\` for a table without `escapeChar` or with
+  `escapeChar` `"`), a `\` in a value is doubled, so that it reads back as one. NULL is written
   as an empty field, which reads back as an empty string in a string column, false in a boolean column and NULL
   elsewhere only with `use.null.for.invalid.data`; otherwise reading it fails.
 - Not supported, for reads and writes: footer lines (`skip.footer.line.count`), header lines in JsonSerDe tables, nested
-  columns, multi-byte quote or escape characters, an OpenCSVSerde separator that is the quote character, and for
-  LazySimpleSerDe `serialization.escape.crlf`, an `escape.delim`
+  columns, multi-byte quote or escape characters, an OpenCSVSerde separator or quote that is another of its three
+  characters, and for LazySimpleSerDe `serialization.escape.crlf`, an `escape.delim`
   that is the delimiter or longer than one byte, a non-UTF-8 `serialization.encoding`,
   `serialization.last.column.takes.rest`, NUL or line-break delimiters and a delimiter in the NULL string. Writes need a
   single-byte delimiter.
@@ -193,7 +198,8 @@ their codec themselves.
   `TIMESTAMP_NS`/`_MS`/`_S` (Hive's `timestamp` is `TIMESTAMP`, in microseconds).
   For csv, `delimiter = '|'` sets the field delimiter (`field.delim`), `header = true` makes every file start with a
   header line (`skip.header.line.count`), and `quote = '"'` / `escape = '\'` switch the table to OpenCSVSerde with
-  `separatorChar` / `quoteChar` / `escapeChar` (the escape character defaults to the quote character).
+  `separatorChar` / `quoteChar` / `escapeChar` (the escape character defaults to the quote character, which
+  OpenCSVSerde reads as `\`).
   With `SET glue_create_bucketed_tables = true`, `BucketColumns = ['col', ...]`, `NumberOfBuckets = n` and
   `SortColumns = [{'Column': 'col', 'SortOrder': 1}, ...]` (1 ascending, 0 descending) create a bucketed (clustered)
   table, Hive's `CLUSTERED BY (...) SORTED BY (...) INTO n BUCKETS`: bucket and sort columns are columns of the table
@@ -352,10 +358,9 @@ of a Glue table or of a `hive_scan()` call, using only core DuckDB types:
   `hive_partitioning := false`. A column of a SerDe text table is the field read as text and converted with `TRY_CAST`
   (`CAST` without `use.null.for.invalid.data` in an OpenCSVSerde table, `lower(field) = 'true'` for an OpenCSVSerde
   boolean), of the field wrapped in `__internal_barrier`, so the caller's optimizer does not push the conversion into
-  `read_csv`, which would convert the text itself and strictly. In an OpenCSVSerde table without `escapeChar`, or with
-  `escapeChar` `\`, `read_csv` splits each line only at its NUL bytes, into the columns, and a field is
-  `hive_opencsv_field(concat_ws(chr(0), <columns>), <index>, ...)`, which joins the line again and splits it as the
-  scan does.
+  `read_csv`, which would convert the text itself and strictly. In an OpenCSVSerde table `read_csv` splits each line
+  only at its NUL bytes, into the columns, and a field is `hive_opencsv_field(concat_ws(chr(0), <columns>), <index>,
+  ...)`, which joins the line again and splits it as the scan does; the call needs this extension loaded.
 - `HiveScanGetFilePartitionValues(get, path)`: the values of the partition a listed file belongs to, as constants of
   the partition columns' types. The path is the file's as the scan listed it, or another spelling of it that DuckDB's
   `Path` normalizes to it (`s3://b//x` or `s3://b/./x` for `s3://b/x`).
